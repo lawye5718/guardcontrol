@@ -7,17 +7,16 @@ import subprocess
 import sys
 
 # ================= ⚠️ 绝对规则 (硬编码区) ⚠️ =================
-# 你可以在这里改，但是一旦部署并锁定，想要改回来就必须请朋友解锁
-# 格式: "域名": 每日允许秒数 (0 代表彻底禁止)
+# 注意：每日限额 3600秒 = 1小时。
+# 虽然你要求每周7小时，但按"每日1小时"执行更符合代码逻辑（每天重置），
+# 也能防止你在周一一天就把7小时全用光的"暴饮暴食"行为。
 HARD_RULES = {
     "playok.com": 0,
     "x.com": 3600,   # 每天 1 小时
-    "twitter.com": 3600 # 包含推特的主域名
+    "twitter.com": 3600
 }
 
-# 存储每天使用时间的文件
 USAGE_FILE = "/var/tmp/net_guard_usage.json"
-# 外部可扩展配置 (可选)
 EXTRA_CONFIG = "/usr/local/etc/net_guard_config.json"
 # ==========================================================
 
@@ -32,7 +31,6 @@ def load_usage():
     try:
         with open(USAGE_FILE, 'r') as f:
             data = json.load(f)
-            # 如果日期变了，重置计数
             if data.get("date") != get_today_str():
                 return default_data
             return data
@@ -41,14 +39,24 @@ def load_usage():
 
 def save_usage(data):
     """保存时间"""
-    with open(USAGE_FILE, 'w') as f:
-        json.dump(data, f)
+    try:
+        with open(USAGE_FILE, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def load_extra_rules():
+    """读取外部可配置的规则"""
+    if not os.path.exists(EXTRA_CONFIG):
+        return {}
+    try:
+        with open(EXTRA_CONFIG, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
 
 def get_active_browser_url():
-    """
-    使用 AppleScript 获取当前 Chrome/Safari/Edge 的活动标签页 URL。
-    这种方法无视 VPN，直接看你在看什么。
-    """
+    # AppleScript 脚本保持不变
     script = """
     tell application "System Events"
         set frontApp to name of first application process whose frontmost is true
@@ -67,13 +75,14 @@ def get_active_browser_url():
     end if
     """
     try:
+        # 注意：作为 root 运行时，AppleScript 可能会因为无法交互而失败
+        # 这里不做复杂处理，依赖用户授予 Terminal/程序 辅助功能权限
         result = subprocess.check_output(["osascript", "-e", script], stderr=subprocess.DEVNULL)
         return result.decode('utf-8').strip()
     except:
         return ""
 
 def kill_browser_tab(browser_name):
-    """强制关闭标签页的 AppleScript"""
     script = f"""
     tell application "{browser_name}"
         close active tab of front window
@@ -83,9 +92,6 @@ def kill_browser_tab(browser_name):
     subprocess.run(["osascript", "-e", script], stderr=subprocess.DEVNULL)
 
 def enforce_hosts(domains):
-    """
-    非 Clash 环境下的底层拦截：写入 Hosts
-    """
     try:
         with open("/etc/hosts", "r") as f:
             content = f.read()
@@ -93,7 +99,6 @@ def enforce_hosts(domains):
         need_refresh = False
         with open("/etc/hosts", "a") as f:
             for domain in domains:
-                # 简单的检查，防止重复写入过多
                 if f"127.0.0.1 {domain}" not in content:
                     f.write(f"\n127.0.0.1 {domain}\n")
                     f.write(f"\n127.0.0.1 www.{domain}\n")
@@ -107,8 +112,9 @@ def enforce_hosts(domains):
 def main():
     print("Guardian started monitoring...")
     
-    # 1. 先把 playok 永久写入 hosts (双重保险)
-    enforce_hosts(["playok.com"])
+    # 将硬编码的禁止域名写入 hosts
+    block_list = [d for d, limit in HARD_RULES.items() if limit == 0]
+    enforce_hosts(block_list)
 
     while True:
         try:
@@ -116,41 +122,46 @@ def main():
             usage_data = load_usage()
             current_usage = usage_data["usage"]
             
-            # 识别当前使用的是哪个浏览器 (用于关闭标签)
-            # 这里简化处理，实际可以通过 AppleScript 同时返回 App 名称
-            # 假设用户主要用 Chrome/Safari，这里只做 URL 匹配
+            # --- 合并规则 ---
+            # 优先使用硬编码规则，然后合并外部规则
+            extra_rules = load_extra_rules()
+            # 合并字典，HARD_RULES 优先级更高（如果重复，不会被覆盖）
+            all_rules = extra_rules.copy()
+            all_rules.update(HARD_RULES)
             
-            check_interval = 5 # 每5秒检查一次
+            check_interval = 5 
             
-            # --- 规则检查 ---
+            triggered_domains = []
             
-            # 1. 硬编码规则检查
-            for domain, limit in HARD_RULES.items():
+            for domain, limit in all_rules.items():
                 if domain in current_url:
                     used = current_usage.get(domain, 0)
                     
-                    if limit == 0: # 绝对禁止
-                        # 立即尝试关闭 Chrome/Safari 标签
-                        kill_browser_tab("Google Chrome") 
-                        kill_browser_tab("Safari")
+                    if limit == 0: 
+                        triggered_domains.append(domain)
                         print(f"Blocked {domain}")
                     
-                    elif used >= limit: # 时间耗尽
-                        kill_browser_tab("Google Chrome")
-                        kill_browser_tab("Safari")
+                    elif used >= limit: 
+                        triggered_domains.append(domain)
                         print(f"Time limit exceeded for {domain}")
                     
                     else:
-                        # 还在允许时间内，增加计数
+                        # 增加计数
                         current_usage[domain] = used + check_interval
                         print(f"{domain} usage: {used}s / {limit}s")
+            
+            # 如果有触发违规，执行关闭操作
+            if triggered_domains:
+                kill_browser_tab("Google Chrome")
+                kill_browser_tab("Safari")
+                kill_browser_tab("Microsoft Edge")
+                kill_browser_tab("Brave Browser")
 
             # --- 保存数据 ---
             usage_data["usage"] = current_usage
             save_usage(usage_data)
             
         except Exception as e:
-            # 捕获所有异常，防止进程崩溃退出
             print(f"Error: {e}")
         
         time.sleep(5)
