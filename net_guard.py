@@ -7,12 +7,10 @@ import subprocess
 import sys
 
 # ================= ⚠️ 绝对规则 (硬编码区) ⚠️ =================
-# 注意：每日限额 3600秒 = 1小时。
-# 虽然你要求每周7小时，但按"每日1小时"执行更符合代码逻辑（每天重置），
-# 也能防止你在周一一天就把7小时全用光的"暴饮暴食"行为。
+# 每日限额 3600秒 = 1小时
 HARD_RULES = {
     "playok.com": 0,
-    "x.com": 3600,   # 每天 1 小时
+    "x.com": 3600,
     "twitter.com": 3600
 }
 
@@ -55,14 +53,25 @@ def load_extra_rules():
     except:
         return {}
 
+def get_console_user():
+    """获取当前登录到物理控制台的用户名"""
+    try:
+        # stat -f%Su /dev/console 可以获取当前控制台的所有者
+        return subprocess.check_output(['stat', '-f%Su', '/dev/console']).decode('utf-8').strip()
+    except:
+        return None
+
 def get_active_browser_url():
-    # AppleScript 脚本保持不变
+    """
+    使用 AppleScript 获取 URL。
+    关键修正：以当前登录用户的身份运行 osascript，而不是 root。
+    """
     script = """
     tell application "System Events"
         set frontApp to name of first application process whose frontmost is true
     end tell
     
-    if frontApp is "Google Chrome" or frontApp is "Microsoft Edge" or frontApp is "Brave Browser" then
+    if frontApp is "Google Chrome" or frontApp is "Microsoft Edge" or frontApp is "Brave Browser" or frontApp is "Arc" then
         tell application frontApp
             return URL of active tab of front window
         end tell
@@ -74,22 +83,42 @@ def get_active_browser_url():
         return ""
     end if
     """
+    
     try:
-        # 注意：作为 root 运行时，AppleScript 可能会因为无法交互而失败
-        # 这里不做复杂处理，依赖用户授予 Terminal/程序 辅助功能权限
-        result = subprocess.check_output(["osascript", "-e", script], stderr=subprocess.DEVNULL)
+        user = get_console_user()
+        if user and user != "root":
+            # 这里的魔法：用 sudo -u <用户> 切换身份去执行 osascript
+            # 这样才能访问该用户的窗口服务器
+            cmd = ["sudo", "-u", user, "osascript", "-e", script]
+        else:
+            # 如果获取不到用户，只能尝试直接运行（可能会失败）
+            cmd = ["osascript", "-e", script]
+
+        result = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         return result.decode('utf-8').strip()
-    except:
+    except Exception as e:
+        # 这里返回空字符串，避免报错刷屏
         return ""
 
 def kill_browser_tab(browser_name):
+    """
+    关闭标签页同样需要以用户身份执行
+    """
     script = f"""
     tell application "{browser_name}"
         close active tab of front window
         display notification "已拦截违规访问！" with title "NetGuard"
     end tell
     """
-    subprocess.run(["osascript", "-e", script], stderr=subprocess.DEVNULL)
+    try:
+        user = get_console_user()
+        if user and user != "root":
+            cmd = ["sudo", "-u", user, "osascript", "-e", script]
+        else:
+            cmd = ["osascript", "-e", script]
+        subprocess.run(cmd, stderr=subprocess.DEVNULL)
+    except:
+        pass
 
 def enforce_hosts(domains):
     try:
@@ -112,59 +141,65 @@ def enforce_hosts(domains):
 def main():
     print("Guardian started monitoring...")
     
-    # 将硬编码的禁止域名写入 hosts
+    # 1. Hosts 拦截 (Root 权限执行)
     block_list = [d for d, limit in HARD_RULES.items() if limit == 0]
     enforce_hosts(block_list)
 
     while True:
         try:
+            # 2. URL 监控 (切换为用户权限执行)
             current_url = get_active_browser_url()
+            
+            # 简单的调试输出，确认能不能抓到
+            if current_url:
+                # print(f"DEBUG: Current URL: {current_url}") # 调试完可注释掉
+                pass
+
             usage_data = load_usage()
             current_usage = usage_data["usage"]
             
-            # --- 合并规则 ---
-            # 优先使用硬编码规则，然后合并外部规则
+            # 合并规则
             extra_rules = load_extra_rules()
-            # 合并字典，HARD_RULES 优先级更高（如果重复，不会被覆盖）
             all_rules = extra_rules.copy()
             all_rules.update(HARD_RULES)
             
-            check_interval = 5 
-            
-            triggered_domains = []
-            
+            check_interval = 2 # 提高一点频率，2秒检查一次
+            triggered_apps = set() # 记录需要关闭的浏览器类型
+
             for domain, limit in all_rules.items():
                 if domain in current_url:
                     used = current_usage.get(domain, 0)
                     
                     if limit == 0: 
-                        triggered_domains.append(domain)
-                        print(f"Blocked {domain}")
+                        print(f"Blocked access to {domain}")
+                        triggered_apps.add("Google Chrome")
+                        triggered_apps.add("Safari")
+                        triggered_apps.add("Microsoft Edge")
                     
                     elif used >= limit: 
-                        triggered_domains.append(domain)
                         print(f"Time limit exceeded for {domain}")
+                        triggered_apps.add("Google Chrome")
+                        triggered_apps.add("Safari")
+                        triggered_apps.add("Microsoft Edge")
                     
                     else:
-                        # 增加计数
                         current_usage[domain] = used + check_interval
                         print(f"{domain} usage: {used}s / {limit}s")
             
-            # 如果有触发违规，执行关闭操作
-            if triggered_domains:
-                kill_browser_tab("Google Chrome")
-                kill_browser_tab("Safari")
-                kill_browser_tab("Microsoft Edge")
-                kill_browser_tab("Brave Browser")
+            # 执行关闭操作
+            for app in triggered_apps:
+                kill_browser_tab(app)
 
-            # --- 保存数据 ---
             usage_data["usage"] = current_usage
             save_usage(usage_data)
             
+        except KeyboardInterrupt:
+            break
         except Exception as e:
-            print(f"Error: {e}")
+            # print(f"Main loop error: {e}")
+            pass
         
-        time.sleep(5)
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
