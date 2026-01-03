@@ -7,14 +7,15 @@ import json
 import urllib.request
 import glob
 
-# ================= ⚙️ 配置区域 (必填) =================
+# ================= ⚙️ 配置区域 (已根据你的反馈修正) =================
 # 你的 macOS 用户名
 USER_NAME = "yuanliang" 
 
 # Clash API 地址
 CLASH_API_URL = "http://127.0.0.1:9090"
 
-# Clash 配置文件的常见根目录 (Clash X / Pro 默认都在这里)
+# Clash 配置文件的根目录 (修正为你的实际路径)
+# 脚本将扫描此目录下所有的 .yaml 文件
 CLASH_BASE_DIR = f"/Users/{USER_NAME}/.config/clash"
 # ==========================================================
 
@@ -24,6 +25,7 @@ BLOCKED_DOMAINS = [
     "www.playok.com"
 ]
 
+# Clash 规则字符串
 CLASH_RULE_STR = "  - DOMAIN-SUFFIX,playok.com,REJECT"
 # ===============================================
 
@@ -53,35 +55,34 @@ def enforce_hosts():
     except Exception:
         pass
 
-def get_api_config_path():
-    """尝试从 API 获取路径 (可能会失败返回 None)"""
+def get_api_active_config_path():
+    """
+    1. 优选策略：尝试从 API 获取当前正在使用的配置文件路径
+    """
     try:
         req = urllib.request.Request(f"{CLASH_API_URL}/configs")
         with urllib.request.urlopen(req, timeout=2) as response:
             data = json.loads(response.read().decode())
+            # API 返回的 path 可能是绝对路径，直接返回
             return data.get("path")
     except:
         return None
 
 def find_all_config_files():
     """
-    [Plan B] 扫描所有可能的配置文件
+    2. 全方位查找策略：扫描 CLASH_BASE_DIR 下所有的 .yaml 和 .yml 文件
+    修正：不找 profiles 目录，直接找根目录
     """
-    candidates = []
+    candidates = set()
     
-    # 1. 默认 config.yaml
-    default_cfg = os.path.join(CLASH_BASE_DIR, "config.yaml")
-    if os.path.exists(default_cfg):
-        candidates.append(default_cfg)
+    # 扫描目录下的所有 .yaml 文件 (包括 config.yaml 和 0814v2yun.yaml 等)
+    yaml_files = glob.glob(os.path.join(CLASH_BASE_DIR, "*.yaml"))
+    yml_files = glob.glob(os.path.join(CLASH_BASE_DIR, "*.yml"))
     
-    # 2. profiles 目录下的所有 yaml 文件 (订阅文件)
-    profiles_dir = os.path.join(CLASH_BASE_DIR, "profiles")
-    if os.path.exists(profiles_dir):
-        # 扫描 .yaml 和 .yml
-        candidates.extend(glob.glob(os.path.join(profiles_dir, "*.yaml")))
-        candidates.extend(glob.glob(os.path.join(profiles_dir, "*.yml")))
-    
-    return candidates
+    for f in yaml_files + yml_files:
+        candidates.add(f)
+        
+    return list(candidates)
 
 def inject_rule_to_file(file_path):
     """将规则写入指定文件"""
@@ -94,25 +95,27 @@ def inject_rule_to_file(file_path):
 
         # 检查是否已存在
         if "playok.com,REJECT" in content:
-            return False # 规则已存在
+            return False # 规则已存在，跳过
 
         # 插入规则
         new_lines = []
         inserted = False
         for line in lines:
             new_lines.append(line)
+            # 在 'rules:' 这一行下面立刻插入我们的规则
             if line.strip().startswith('rules:') and not inserted:
                 new_lines.append(CLASH_RULE_STR + "\n")
                 inserted = True
         
         if not inserted:
+            # 如果没找到 rules:，就追加在最后
             new_lines.append("rules:\n")
             new_lines.append(CLASH_RULE_STR + "\n")
 
         with open(file_path, 'w') as f:
             f.writelines(new_lines)
 
-        # 修正权限 (chown 回给用户)
+        # 关键：修正权限 (把文件所有者改回 yuanliang)
         try:
             uid = int(subprocess.check_output(['id', '-u', USER_NAME]).strip())
             gid = int(subprocess.check_output(['id', '-g', USER_NAME]).strip())
@@ -127,7 +130,7 @@ def inject_rule_to_file(file_path):
 def force_reload_clash(config_path=None):
     """强制 Clash 重载配置"""
     try:
-        # 如果不知道具体路径，就只发送重载信号
+        # 如果能提供具体路径最好，否则只发重载信号
         payload = {}
         if config_path:
             payload = {"path": config_path}
@@ -140,35 +143,39 @@ def force_reload_clash(config_path=None):
     except:
         pass
 
-def enforce_clash_shotgun():
+def enforce_clash_strategy():
     """
-    全覆盖模式：无论 API 返回什么，扫描所有文件并注入
+    执行策略：
+    1. 尝试获取 API 当前路径 -> 注入 -> 重载 (精确打击)
+    2. 扫描目录下所有 YAML -> 注入 (地毯式轰炸，防止切换)
     """
-    # 1. 尝试获取 API 指向的特定文件
-    api_path = get_api_config_path()
     
-    targets = set()
-    if api_path:
-        targets.add(api_path)
+    # 集合用于去重，避免重复处理
+    target_files = set()
+
+    # 步骤 1: 获取 API 当前正在用的文件 (高优先级)
+    active_path = get_api_active_config_path()
+    if active_path:
+        target_files.add(active_path)
     
-    # 2. 扫描本地所有可能的配置文件
-    local_files = find_all_config_files()
-    for f in local_files:
-        targets.add(f)
+    # 步骤 2: 扫描目录下所有可能的文件 (补齐路径)
+    all_local_files = find_all_config_files()
+    for f in all_local_files:
+        target_files.add(f)
     
-    # 3. 对找到的每一个文件执行注入
+    # 步骤 3: 对所有目标文件执行注入
     any_modified = False
-    for path in targets:
+    for path in target_files:
         if inject_rule_to_file(path):
             any_modified = True
-            # print(f"Injected rule into: {path}")
+            # print(f"Injected rule into: {path}") # 仅调试用
     
-    # 4. 只有当文件确实被修改过，或者我们知道确切路径时，才触发重载
-    # 如果不知道路径且没改文件，就不频繁重载以免打断连接
+    # 步骤 4: 触发重载
+    # 如果修改了文件，或者我们明确知道当前活跃的是哪个文件，就触发重载
     if any_modified:
-        force_reload_clash(api_path)
-    elif api_path:
-        # 即使没修改(可能被手动恢复了)，如果知道路径，也确保重载一次以防万一
+        force_reload_clash(active_path)
+    elif active_path:
+        # 即使没修改(可能已经被手动改回去了)，也强制重载确保生效
         pass 
 
 def main():
@@ -178,7 +185,8 @@ def main():
 
     while True:
         enforce_hosts()
-        enforce_clash_shotgun()
+        enforce_clash_strategy()
+        # 2分钟检查一次
         time.sleep(120)
 
 if __name__ == "__main__":
